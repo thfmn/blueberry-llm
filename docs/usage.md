@@ -33,6 +33,12 @@ python experiments/run_scaling.py --regime params --experts 1,2,4,8,16,32 --out-
 python experiments/plotting.py --csv experiments/out/results_flops.csv --out experiments/plots
 ```
 
+### Generate Mock Plots for Docs
+
+```bash
+python -m experiments.generate_mock_plots --out docs/assets/plots
+```
+
 ## Build Docs
 
 ```bash
@@ -42,4 +48,3 @@ mkdocs serve -a 0.0.0.0:8000
 
 !!! note
     Data download for training uses Hugging Face datasets and may require network access.
-
