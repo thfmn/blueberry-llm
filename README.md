@@ -16,6 +16,27 @@ python train_auto.py
 
 This is an **open research project** - we encourage everyone to fork the project, run experiments, and submit pull requests with improvements.
 
+### New: Experiment CLI
+
+Run orchestrated experiments, scaling grids, and deliverable generation with the Typer-based tool:
+
+```bash
+python -m blueberry_cli run --help
+python -m blueberry_cli grid --help
+./blueberry  # interactive wizard
+```
+
+Artifacts are collected under `experiments/runs/<experiment_id>/` (metrics, checkpoints, Markdown reports, and `deliverables.json`) and optionally synced to Weights & Biases.
+
+### Guided Wizard Experience
+
+Launching `./blueberry` (or `python -m blueberry_cli`) opens a Rich-powered dashboard that:
+
+- Detects GPUs/CPUs and presents a hardware summary
+- Suggests an architecture, lets you tweak dimensions, and estimates total/active parameters
+- Configures evaluation cadence, seeds, and logging options (W&B included)
+- Exports configs or hands the settings off to the `run` command for training + eval
+
 ## Research Questions
 
 - Can we achieve better parameter efficiency with sparse expert activation?
