@@ -208,3 +208,10 @@ __marimo__/
 
 # Codex
 AGENTS.md
+QWEN.md
+
+MoE*
+evalthai*
+wandb*
+data_cache/*
+draft/*
