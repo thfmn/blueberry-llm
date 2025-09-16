@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import asdict
-from typing import Dict, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import torch
 
@@ -48,7 +48,14 @@ def _gather_router_stats(model: torch.nn.Module) -> Dict[str, object]:
     return stats
 
 
-def run_single_experiment(config: MoEModelConfig) -> Tuple[MoEMinimalLLM, Dict[str, object]]:
+LogHook = Callable[[str, Dict[str, object]], None]
+
+
+def run_single_experiment(
+    config: MoEModelConfig,
+    *,
+    log_hook: Optional[LogHook] = None,
+) -> Tuple[MoEMinimalLLM, Dict[str, object]]:
     """Run a short train+eval according to `config` and return metrics.
 
     Returns a trained model (for potential checkpointing) and a metrics dict
@@ -110,6 +117,16 @@ def run_single_experiment(config: MoEModelConfig) -> Tuple[MoEMinimalLLM, Dict[s
         if aux_loss is not None:
             aux_sum += float(aux_loss.detach().item())
             aux_count += 1
+        if log_hook is not None:
+            log_hook(
+                "train",
+                {
+                    "step": steps,
+                    "loss": float(loss.detach().cpu().item()),
+                    "cross_entropy": float(ce.detach().cpu().item()),
+                    "aux_loss": float(aux_loss.detach().cpu().item()) if aux_loss is not None else None,
+                },
+            )
 
     wall_s = time.time() - start_t
     tokens_seen = steps * tokens_per_step
@@ -122,6 +139,10 @@ def run_single_experiment(config: MoEModelConfig) -> Tuple[MoEMinimalLLM, Dict[s
 
     # Final eval
     final = evaluate_model(model, val_loader, config)
+    if log_hook is not None:
+        eval_metrics = {f"eval_{k}": v for k, v in final.items() if isinstance(v, (int, float))}
+        eval_metrics.update({"step": steps})
+        log_hook("eval", eval_metrics)
 
     # Compose metrics
     metrics: Dict[str, object] = {
@@ -143,4 +164,15 @@ def run_single_experiment(config: MoEModelConfig) -> Tuple[MoEMinimalLLM, Dict[s
     metrics.update(final)
     metrics.update(asdict(config))  # include config fields (safe dataclass fields)
     metrics.update(_gather_router_stats(model))
+    if log_hook is not None:
+        summary_payload = {
+            "wall_time_s": wall_s,
+            "tokens_seen": tokens_seen,
+            "tokens_per_second": tps,
+            "peak_mem_bytes": peak_mem_bytes,
+        }
+        for key in ("val_loss", "val_accuracy", "val_perplexity"):
+            if key in final:
+                summary_payload[f"final_{key}"] = final[key]
+        log_hook("summary", summary_payload)
     return model, metrics

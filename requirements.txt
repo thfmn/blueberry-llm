@@ -8,3 +8,7 @@ matplotlib
 seaborn
 mkdocs
 mkdocs-material
+pymdown-extensions
+typer
+rich
+wandb
