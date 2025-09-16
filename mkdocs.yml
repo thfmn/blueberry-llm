@@ -14,6 +14,8 @@ markdown_extensions:
   - pymdownx.superfences
   - pymdownx.highlight
   - pymdownx.tabbed
+  - pymdownx.arithmatex:
+      generic: true
 plugins:
   - search
 nav:
@@ -22,3 +24,8 @@ nav:
   - Usage: usage.md
   - Plots: plots.md
   - Research Guide: research_tutorial.md
+  - Theory: theory.md
+  - References: references.md
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
