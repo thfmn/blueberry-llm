@@ -69,6 +69,8 @@ def _render_config(console: Console, config: MoEModelConfig) -> None:
         ("expert_top_k", config.expert_top_k),
         ("batch_size", config.batch_size),
         ("grad_accum", config.gradient_accumulation_steps),
+        ("optimizer", getattr(config, "optimizer", "adamw")),
+        ("learning_rate", getattr(config, "learning_rate", None)),
         ("muon_lr", config.muon_lr),
         ("max_seq_len", config.max_seq_len),
         ("max_steps", config.max_steps),
@@ -157,6 +159,15 @@ def run_wizard(
             "Gradient accumulation steps", config.gradient_accumulation_steps
         )
         config.muon_lr = _prompt_float("Muon learning rate", config.muon_lr, minimum=1e-5)
+        current_lr = getattr(config, "learning_rate", config.muon_lr * 0.1)
+        config.learning_rate = _prompt_float("AdamW learning rate", current_lr, minimum=1e-6)
+        optimizer_choice = typer.prompt(
+            "Optimizer (adamw/muon)", default=getattr(config, "optimizer", "adamw")
+        )
+        config.optimizer = optimizer_choice.strip().lower() or "adamw"
+        if config.optimizer not in {"adamw", "muon"}:
+            typer.echo("Unknown optimizer; defaulting to adamw")
+            config.optimizer = "adamw"
         config.max_steps = _prompt_int("Training steps", config.max_steps)
     if typer.confirm("Adjust sequence length or evaluation settings?", default=False):
         config.max_seq_len = _prompt_int("Max sequence length", config.max_seq_len)

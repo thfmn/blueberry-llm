@@ -13,6 +13,8 @@ from experiments.train_eval import run_single_experiment
 from llm import MoEModelConfig, set_seed
 
 from .config import ExperimentPaths, ExperimentRequest, WandbSettings
+from .storage import write_json
+from .system_info import gather_environment_metadata
 from .wandb_utils import wandb_run
 
 
@@ -62,6 +64,7 @@ class SingleRunResult:
         summary_events: List[Dict[str, Any]],
         wandb_info: Optional[Dict[str, Any]],
         checkpoint_path: Optional[Path],
+        environment_path: Optional[Path],
         error: Optional[str] = None,
     ) -> None:
         self.status = status
@@ -74,6 +77,7 @@ class SingleRunResult:
         self.summary_events = summary_events
         self.wandb_info = wandb_info
         self.checkpoint_path = checkpoint_path
+        self.environment_path = environment_path
         self.error = error
 
 
@@ -107,10 +111,15 @@ def run_seed(
     wandb_config = asdict(config)
 
     checkpoint_path: Optional[Path] = None
+    environment_path: Optional[Path] = None
     metrics: Dict[str, Any] = {}
     status = "failed"
     error_message: Optional[str] = None
     completed: Optional[datetime] = None
+
+    environment_metadata = gather_environment_metadata(extra={"seed": seed_value})
+    environment_path = paths.artifacts_dir / "environment.json"
+    write_json(environment_path, environment_metadata)
 
     with wandb_run(
         wandb_settings,
@@ -120,6 +129,12 @@ def run_seed(
         notes=notes,
     ) as wb:
         logger = RunLogger(wb)
+        if wb is not None:
+            try:
+                wb.config.update({"environment": environment_metadata}, allow_val_change=True)
+                wb.save(str(environment_path))
+            except Exception:
+                pass
         try:
             model, metrics = run_single_experiment(config, log_hook=logger)
             budget = ComputeBudget(
@@ -150,6 +165,14 @@ def run_seed(
             }
             torch.save(checkpoint_payload, checkpoint_path)
 
+        if wb is not None:
+            try:
+                summary_updates = {k: v for k, v in metrics.items() if isinstance(v, (int, float))}
+                summary_updates["status"] = status
+                wb.summary.update(summary_updates)
+            except Exception:
+                pass
+
     wandb_info = _extract_wandb_info(locals().get("wb"))
 
     return SingleRunResult(
@@ -163,5 +186,6 @@ def run_seed(
         summary_events=logger.summary_events,
         wandb_info=wandb_info,
         checkpoint_path=checkpoint_path,
+        environment_path=environment_path,
         error=error_message,
     )

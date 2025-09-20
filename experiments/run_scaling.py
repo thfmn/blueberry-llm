@@ -34,6 +34,9 @@ def build_config(
     steps: int,
     seq_len: int,
     collect_router_stats: bool,
+    optimizer: str = "adamw",
+    muon_lr: float = 0.01,
+    learning_rate: float = 0.001,
 ) -> MoEModelConfig:
     top_k = min(top_k, e)
     if regime == "flops":
@@ -54,6 +57,9 @@ def build_config(
         num_experts=e,
         expert_top_k=top_k,
         use_amp=True,
+        optimizer=optimizer,
+        muon_lr=muon_lr,
+        learning_rate=learning_rate,
     )
     # Track router stats if requested
     setattr(cfg, "collect_router_stats", bool(collect_router_stats))
@@ -80,6 +86,9 @@ def run_grid(args: argparse.Namespace) -> None:
                 steps=args.max_steps,
                 seq_len=args.seq_len,
                 collect_router_stats=args.collect_router_stats,
+                optimizer=args.optimizer,
+                muon_lr=args.muon_lr,
+                learning_rate=args.learning_rate,
             )
 
             # Important: vocab_size resolved by data loader; run experiment
@@ -117,10 +126,12 @@ def main() -> None:
     p.add_argument("--seeds", type=int, default=3)
     p.add_argument("--out-dir", default="experiments/out")
     p.add_argument("--collect-router-stats", action="store_true")
+    p.add_argument("--optimizer", default="adamw", choices=["adamw", "muon"])
+    p.add_argument("--muon-lr", dest="muon_lr", type=float, default=0.01)
+    p.add_argument("--learning-rate", dest="learning_rate", type=float, default=0.001)
     args = p.parse_args()
     run_grid(args)
 
 
 if __name__ == "__main__":
     main()
-

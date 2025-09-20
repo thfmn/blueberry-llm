@@ -4,9 +4,16 @@ Auto-configuration for Blueberry LLM
 Detects hardware and automatically configures optimal training setup
 """
 
-import torch
+import platform
 from dataclasses import dataclass
 from typing import Optional
+
+import torch
+
+try:
+    import psutil  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    psutil = None
 
 @dataclass
 class AutoConfig:
@@ -101,17 +108,44 @@ class BlueberryAutoConfigurator:
             use_distributed=False, use_amp=False
         )
     
+    def _format_memory(self, value_gb: float) -> str:
+        return f"{value_gb:.1f} GB"
+
     def print_config(self):
         """Print detected configuration"""
         print("🫐 Blueberry LLM Auto-Configuration")
         print("=" * 50)
-        
+
         if self.config.num_gpus == 0:
             print("🖥️  Mode: CPU Training (Limited)")
         else:
             print(f"🚀 Mode: GPU Training ({self.config.num_gpus} GPUs)")
             print(f"   Memory: {self.config.gpu_memory_gb:.1f} GB per GPU")
-        
+
+        # Hardware summary
+        cpu_name = platform.processor() or "Unknown CPU"
+        machine = platform.machine()
+        print(f"🧮 CPU: {cpu_name} ({machine})")
+
+        if psutil is not None:
+            try:
+                total_ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+                print(f"🗄️  System RAM: {self._format_memory(total_ram_gb)}")
+            except Exception:
+                pass
+        else:
+            print("🗄️  System RAM: psutil not installed (skip)")
+
+        if torch.cuda.is_available():
+            for idx in range(torch.cuda.device_count()):
+                props = torch.cuda.get_device_properties(idx)
+                cc = f"{props.major}.{props.minor}"
+                print(
+                    f"🎮 GPU #{idx}: {props.name} | {props.total_memory / (1024 ** 3):.1f} GB | SM {cc} | {props.multi_processor_count} SMs"
+                )
+        else:
+            print("🎮 GPU: none detected")
+
         print(f"📏 Model: {self.config.d_model}d × {self.config.n_layers}L × {self.config.n_heads}H")
         print(f"🧠 Experts: {self.config.num_experts}")
         print(f"📊 Batch: {self.config.batch_size} (accum: {self.config.gradient_accumulation_steps})")
@@ -137,6 +171,8 @@ class BlueberryAutoConfigurator:
             max_steps=self.config.max_steps,
             gradient_accumulation_steps=self.config.gradient_accumulation_steps,
             muon_lr=self.config.learning_rate,
+            learning_rate=self.config.learning_rate,
+            optimizer="muon",
             max_seq_len=self.config.max_seq_len,
             num_experts=self.config.num_experts,
             use_amp=self.config.use_amp,

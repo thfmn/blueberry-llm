@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import statistics
+import sys
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -19,6 +21,7 @@ from .deliverables import build_deliverable_summary
 from .reporting import render_summary, save_training_curve, write_metrics, write_reports
 from .runner import run_seed
 from .storage import write_json
+from .system_info import gather_environment_metadata
 from .wizard import RunRequest, run_wizard
 
 app = typer.Typer(help="Blueberry LLM experiment control center")
@@ -59,8 +62,10 @@ def run(
     expert_top_k: int = typer.Option(2, help="Experts activated per token."),
     gradient_accumulation_steps: int = typer.Option(4, help="Gradient accumulation steps."),
     muon_lr: float = typer.Option(0.01, help="Muon optimizer base learning rate."),
+    learning_rate: float = typer.Option(0.001, help="Learning rate for non-Muon optimizers."),
     weight_decay: float = typer.Option(0.1, help="Weight decay."),
     dropout: float = typer.Option(0.1, help="Dropout probability."),
+    optimizer: str = typer.Option("adamw", help="Optimizer to use (muon or adamw)."),
     eval_every: int = typer.Option(500, help="Steps between eval passes."),
     eval_steps: int = typer.Option(50, help="Validation steps."),
     collect_router_stats: bool = typer.Option(False, help="Collect router statistics during training."),
@@ -91,6 +96,8 @@ def run(
         expert_top_k=expert_top_k,
         gradient_accumulation_steps=gradient_accumulation_steps,
         muon_lr=muon_lr,
+        learning_rate=learning_rate,
+        optimizer=optimizer,
         weight_decay=weight_decay,
         dropout=dropout,
         eval_every=eval_every,
@@ -117,13 +124,14 @@ def run(
         paths = request.build_run_directory(replicate=replicate)
         run_name = f"{experiment_id}-seed{seed_value}" if num_seeds > 1 else experiment_id
         console.print(f"• Running seed {seed_value} (outputs -> {paths.run_dir})")
+        run_tags = [*tag, f"optimizer:{config.optimizer}"]
         result = run_seed(
             request,
             seed_value=seed_value,
             wandb_settings=wandb_settings,
             paths=paths,
             run_name=run_name,
-            tags=tag,
+            tags=run_tags,
             notes=notes,
             save_checkpoint=save_checkpoint,
         )
@@ -160,6 +168,7 @@ def run(
                 "train_history": history_path,
                 "eval_history": eval_history_path,
                 "summary": summary_path,
+                "environment": result.environment_path,
             },
             report_paths=reports,
             validation_status=validation_results,
@@ -189,6 +198,7 @@ def run(
         aggregate_metrics_path = write_metrics(aggregated, root_paths.artifacts_dir / "aggregate_metrics.json")
         reports = write_reports(root_paths, aggregated, notes)
         status = "completed" if all(res.status == "completed" for _, res in results) else "partial_success"
+        environment_artifact = next((res.environment_path for _, res in results if res.environment_path), None)
         deliverable = build_deliverable_summary(
             experiment_id=experiment_id,
             status=status,
@@ -198,7 +208,10 @@ def run(
             paths=root_paths,
             wandb_info=None,
             checkpoint_path=None,
-            artifact_paths={"aggregate_metrics": aggregate_metrics_path},
+            artifact_paths={
+                "aggregate_metrics": aggregate_metrics_path,
+                "environment_sample": environment_artifact,
+            },
             report_paths=reports,
             validation_status={
                 "all_deliverables_met": status == "completed",
@@ -265,6 +278,9 @@ def grid(
     batch_size: int = typer.Option(16, help="Batch size per run."),
     max_steps: int = typer.Option(200, help="Training steps per run."),
     eval_steps: int = typer.Option(50, help="Validation steps per run."),
+    optimizers: str = typer.Option("adamw", help="Comma-separated optimizers (adamw,muon)."),
+    muon_lr: float = typer.Option(0.01, help="Muon optimizer learning rate."),
+    adamw_lr: float = typer.Option(0.001, help="AdamW learning rate."),
     seed: int = typer.Option(42, help="Base seed for replicates."),
     seeds: int = typer.Option(1, min=1, help="Number of seeds per configuration."),
     collect_router_stats: bool = typer.Option(False, help="Collect router diagnostics."),
@@ -286,6 +302,10 @@ def grid(
     if not expert_values:
         raise typer.BadParameter("No expert counts provided; use e.g. --experts 1,2,4,8")
 
+    optimizer_values = [opt.strip().lower() for opt in optimizers.split(",") if opt.strip()]
+    if not optimizer_values:
+        raise typer.BadParameter("No optimizers provided; use e.g. --optimizers adamw,muon")
+
     wandb_settings = _wandb_settings(wandb_project, wandb_entity, wandb_group, wandb_mode, tag)
     root_paths = ExperimentPaths.from_base(out_dir / experiment_id)
     root_paths.ensure()
@@ -299,131 +319,143 @@ def grid(
     statuses: List[str] = []
     total_duration = 0.0
 
-    for expert in expert_values:
-        cfg = build_scaling_config(
-            regime=regime,
-            d_model=d_model,
-            n_heads=n_heads,
-            n_layers=n_layers,
-            d_ff_dense=d_ff_dense,
-            e=expert,
-            top_k=top_k,
-            base_batch=batch_size,
-            steps=max_steps,
-            seq_len=seq_len,
-            collect_router_stats=collect_router_stats,
-        )
-        cfg.eval_steps = eval_steps
-        variant_label = f"experts_{expert}"
-        request = ExperimentRequest(
-            experiment_id=experiment_id,
-            base_config=cfg,
-            output_root=out_dir,
-            wandb=wandb_settings,
-            notes=notes,
-            tags=tag,
-        )
-
-        for index in range(seeds):
-            seed_value = seed + index
-            replicate = index + 1 if seeds > 1 else None
-            paths = request.build_run_directory(variant=variant_label, replicate=replicate)
-            run_name = f"{experiment_id}-E{expert}-seed{seed_value}"
-            console.print(f"• [experts={expert}] seed {seed_value} -> {paths.run_dir}")
-            result = run_seed(
-                request,
-                seed_value=seed_value,
-                wandb_settings=wandb_settings,
-                paths=paths,
-                run_name=run_name,
-                tags=[*tag, variant_label],
+    for optimizer_name in optimizer_values:
+        for expert in expert_values:
+            cfg = build_scaling_config(
+                regime=regime,
+                d_model=d_model,
+                n_heads=n_heads,
+                n_layers=n_layers,
+                d_ff_dense=d_ff_dense,
+                e=expert,
+                top_k=top_k,
+                base_batch=batch_size,
+                steps=max_steps,
+                seq_len=seq_len,
+                collect_router_stats=collect_router_stats,
+                optimizer=optimizer_name,
+                muon_lr=muon_lr,
+                learning_rate=adamw_lr,
+            )
+            cfg.eval_steps = eval_steps
+            variant_label = f"experts_{expert}_opt_{optimizer_name}"
+            request = ExperimentRequest(
+                experiment_id=experiment_id,
+                base_config=cfg,
+                output_root=out_dir,
+                wandb=wandb_settings,
                 notes=notes,
-                save_checkpoint=save_checkpoint,
+                tags=[*tag, f"optimizer:{optimizer_name}"],
             )
 
-            if first_started is None:
-                first_started = result.started_at
-            if result.completed_at is not None:
-                last_completed = result.completed_at
-            statuses.append(result.status)
-            total_duration += result.duration
+            for index in range(seeds):
+                seed_value = seed + index
+                replicate = index + 1 if seeds > 1 else None
+                paths = request.build_run_directory(variant=variant_label, replicate=replicate)
+                run_name = f"{experiment_id}-E{expert}-{optimizer_name}-seed{seed_value}"
+                console.print(
+                    f"• [experts={expert} | optimizer={optimizer_name}] seed {seed_value} -> {paths.run_dir}"
+                )
+                result = run_seed(
+                    request,
+                    seed_value=seed_value,
+                    wandb_settings=wandb_settings,
+                    paths=paths,
+                    run_name=run_name,
+                    tags=[*tag, variant_label, f"optimizer:{optimizer_name}"],
+                    notes=notes,
+                    save_checkpoint=save_checkpoint,
+                )
 
-            metrics_path = write_metrics(result.metrics, paths.artifacts_dir / "metrics.json")
-            history_path = paths.artifacts_dir / "train_history.json"
-            eval_history_path = paths.artifacts_dir / "eval_history.json"
-            summary_path = paths.artifacts_dir / "summary_events.json"
-            write_json(history_path, result.train_history)
-            write_json(eval_history_path, result.eval_history)
-            write_json(summary_path, result.summary_events)
-            curve_path = save_training_curve(result.train_history, paths.artifacts_dir / "training_curve.png")
-            reports = write_reports(paths, result.metrics, notes)
+                if first_started is None:
+                    first_started = result.started_at
+                if result.completed_at is not None:
+                    last_completed = result.completed_at
+                statuses.append(result.status)
+                total_duration += result.duration
 
-            validation_results = {
-                "all_deliverables_met": result.status == "completed" and metrics_path.exists(),
-                "performance_targets_met": result.metrics.get("val_loss") is not None,
-                "data_integrity_checks_passed": True,
-            }
+                metrics_path = write_metrics(result.metrics, paths.artifacts_dir / "metrics.json")
+                history_path = paths.artifacts_dir / "train_history.json"
+                eval_history_path = paths.artifacts_dir / "eval_history.json"
+                summary_path = paths.artifacts_dir / "summary_events.json"
+                write_json(history_path, result.train_history)
+                write_json(eval_history_path, result.eval_history)
+                write_json(summary_path, result.summary_events)
+                curve_path = save_training_curve(
+                    result.train_history, paths.artifacts_dir / "training_curve.png"
+                )
+                reports = write_reports(paths, result.metrics, notes)
 
-            deliverable = build_deliverable_summary(
-                experiment_id=f"{experiment_id}:{variant_label}",
-                status=result.status,
-                started_at=result.started_at,
-                completed_at=result.completed_at,
-                metrics=result.metrics,
-                paths=paths,
-                wandb_info=result.wandb_info,
-                checkpoint_path=result.checkpoint_path,
-                artifact_paths={
-                    "metrics": metrics_path,
-                    "training_curve": curve_path,
-                    "train_history": history_path,
-                    "eval_history": eval_history_path,
-                    "summary": summary_path,
-                },
-                report_paths=reports,
-                validation_status=validation_results,
-            )
-            write_json(paths.run_dir / "deliverables.json", deliverable)
-            render_summary(
-                console,
-                experiment_id=f"{experiment_id} [{variant_label}]",
-                status=result.status,
-                metrics=result.metrics,
-                duration=result.duration,
-                artifacts={
-                    "checkpoint": result.checkpoint_path,
-                    "metrics": metrics_path,
-                    "training_curve": curve_path,
-                },
-            )
+                validation_results = {
+                    "all_deliverables_met": result.status == "completed" and metrics_path.exists(),
+                    "performance_targets_met": result.metrics.get("val_loss") is not None,
+                    "data_integrity_checks_passed": True,
+                }
 
-            csv_row = {
-                "experiment_id": experiment_id,
-                "variant": variant_label,
-                "seed": seed_value,
-                "regime": regime,
-            }
-            for key, value in result.metrics.items():
-                if isinstance(value, (int, float, str, bool)):
-                    csv_row[key] = value
-            append_row_csv(csv_path, csv_row)
-            summary_rows.append(
-                {
+                deliverable = build_deliverable_summary(
+                    experiment_id=f"{experiment_id}:{variant_label}",
+                    status=result.status,
+                    started_at=result.started_at,
+                    completed_at=result.completed_at,
+                    metrics=result.metrics,
+                    paths=paths,
+                    wandb_info=result.wandb_info,
+                    checkpoint_path=result.checkpoint_path,
+                    artifact_paths={
+                        "metrics": metrics_path,
+                        "training_curve": curve_path,
+                        "train_history": history_path,
+                        "eval_history": eval_history_path,
+                        "summary": summary_path,
+                        "environment": result.environment_path,
+                    },
+                    report_paths=reports,
+                    validation_status=validation_results,
+                )
+                write_json(paths.run_dir / "deliverables.json", deliverable)
+                render_summary(
+                    console,
+                    experiment_id=f"{experiment_id} [{variant_label}]",
+                    status=result.status,
+                    metrics=result.metrics,
+                    duration=result.duration,
+                    artifacts={
+                        "checkpoint": result.checkpoint_path,
+                        "metrics": metrics_path,
+                        "training_curve": curve_path,
+                    },
+                )
+
+                csv_row = {
+                    "experiment_id": experiment_id,
                     "variant": variant_label,
                     "seed": seed_value,
-                    "started_at": result.started_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "completed_at": result.completed_at.strftime("%Y-%m-%dT%H:%M:%SZ") if result.completed_at else None,
-                    "duration": result.duration,
-                    "metrics": {
-                        key: value
-                        for key, value in result.metrics.items()
-                        if isinstance(value, (int, float))
-                    },
+                    "regime": regime,
+                    "optimizer": optimizer_name,
                 }
-            )
-            aggregated_by_variant.setdefault(variant_label, []).append(summary_rows[-1]["metrics"])
+                for key, value in result.metrics.items():
+                    if isinstance(value, (int, float, str, bool)):
+                        csv_row[key] = value
+                append_row_csv(csv_path, csv_row)
+                summary_rows.append(
+                    {
+                        "variant": variant_label,
+                        "seed": seed_value,
+                        "optimizer": optimizer_name,
+                        "started_at": result.started_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "completed_at": result.completed_at.strftime("%Y-%m-%dT%H:%M:%SZ") if result.completed_at else None,
+                        "duration": result.duration,
+                        "metrics": {
+                            key: value
+                            for key, value in result.metrics.items()
+                            if isinstance(value, (int, float))
+                        },
+                    }
+                )
+                aggregated_by_variant.setdefault(variant_label, []).append(summary_rows[-1]["metrics"])
 
-    write_json(root_paths.run_dir / "grid_summary.json", summary_rows)
+    summary_path = root_paths.run_dir / "grid_summary.json"
+    write_json(summary_path, summary_rows)
 
     aggregate_payload: Dict[str, Dict[str, float]] = {}
     for variant, entries in aggregated_by_variant.items():
@@ -432,11 +464,46 @@ def grid(
         totals: Dict[str, List[float]] = {}
         for entry in entries:
             for key, value in entry.items():
-                totals.setdefault(key, []).append(value)
-        aggregate_payload[variant] = {
-            f"{key}_mean": statistics.mean(values) for key, values in totals.items()
-        }
-    write_json(root_paths.run_dir / "grid_aggregate.json", aggregate_payload)
+                totals.setdefault(key, []).append(float(value))
+        stats_payload: Dict[str, float] = {"count": float(len(entries))}
+        for key, values in totals.items():
+            stats_payload[f"{key}_mean"] = statistics.mean(values)
+            if len(values) > 1:
+                stats_payload[f"{key}_std"] = statistics.stdev(values)
+        aggregate_payload[variant] = stats_payload
+    aggregate_path = root_paths.run_dir / "grid_aggregate.json"
+    write_json(aggregate_path, aggregate_payload)
+
+    status_counter = Counter(statuses)
+    meta = gather_environment_metadata(include_snapshot=False)
+    grid_metadata = {
+        "command": " ".join(sys.argv),
+        "regime": regime,
+        "experts": expert_values,
+        "optimizers": optimizer_values,
+        "seeds_per_variant": seeds,
+        "status_counts": dict(status_counter),
+        "started_at": first_started.strftime("%Y-%m-%dT%H:%M:%SZ") if first_started else None,
+        "completed_at": last_completed.strftime("%Y-%m-%dT%H:%M:%SZ") if last_completed else None,
+        "total_duration_seconds": total_duration,
+        "git": meta.get("git"),
+        "packages": meta.get("packages"),
+    }
+    metadata_path = root_paths.run_dir / "grid_metadata.json"
+    write_json(metadata_path, grid_metadata)
+
+    plots_dir = root_paths.artifacts_dir / "plots"
+    plots_generated = False
+    if csv_path.exists():
+        try:
+            from experiments.plotting import plot_all  # type: ignore
+
+            plot_all(csv_path, plots_dir)
+            plots_generated = True
+        except Exception as exc:  # pragma: no cover - plotting optional in tests
+            console.print(f"⚠️  Plot generation failed: {exc}")
+    else:
+        console.print("⚠️  No CSV rows logged; skipping plot generation")
 
     best_variant = None
     best_loss = float("inf")
@@ -450,7 +517,9 @@ def grid(
     if best_variant:
         agg_stats = aggregate_payload[best_variant]
         aggregate_metrics = {
+            "variant": best_variant,
             "val_loss": agg_stats.get("val_loss_mean"),
+            "val_loss_std": agg_stats.get("val_loss_std"),
             "val_accuracy": agg_stats.get("val_accuracy_mean"),
             "tokens_per_second": agg_stats.get("tokens_per_second_mean"),
         }
@@ -471,6 +540,10 @@ def grid(
             artifact_paths={
                 "best_metrics": aggregate_metrics_path,
                 "results_csv": csv_path,
+                "grid_summary": summary_path,
+                "grid_aggregate": aggregate_path,
+                "grid_metadata": metadata_path,
+                "plots_dir": plots_dir if plots_generated else None,
             },
             report_paths=reports,
             validation_status={

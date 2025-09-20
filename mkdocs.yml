@@ -22,6 +22,7 @@ nav:
   - Home: index.md
   - Experiments: experiments.md
   - Usage: usage.md
+  - Workflow: workflow.md
   - Plots: plots.md
   - Research Guide: research_tutorial.md
   - Theory: theory.md

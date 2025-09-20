@@ -44,6 +44,8 @@ class MoEModelConfig:
     # Training parameters
     gradient_accumulation_steps: int = 4
     muon_lr: float = 0.01
+    learning_rate: float = 0.001
+    optimizer: str = "muon"
 
     # Data parameters
     max_seq_len: int = 512
@@ -74,6 +76,13 @@ class MoEModelConfig:
     def __post_init__(self):
         self.d_k = self.d_model // self.n_heads
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
+        self.optimizer = (self.optimizer or "muon").lower()
+        if self.optimizer not in {"muon", "adamw"}:
+            raise ValueError(f"Unsupported optimizer: {self.optimizer}")
+        if self.optimizer == "muon" and self.muon_lr <= 0:
+            raise ValueError("muon_lr must be > 0 when using Muon optimizer")
+        if self.optimizer != "muon" and self.learning_rate <= 0:
+            raise ValueError("learning_rate must be > 0 for non-Muon optimizers")
 
 @torch.compile
 def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
@@ -542,24 +551,40 @@ def evaluate_model(model: nn.Module, val_loader: DataLoader, config: MoEModelCon
     return {'val_loss': avg_loss, 'val_accuracy': accuracy, 'val_perplexity': perplexity}
 
 def setup_muon_optimizer(model: nn.Module, config: MoEModelConfig):
-    """Setup Muon optimizer with hybrid approach"""
+    """Setup optimizer(s) based on configuration."""
+    choice = getattr(config, "optimizer", "muon").lower()
+
+    if choice == "adamw":
+        lr = getattr(config, "learning_rate", None) or max(config.muon_lr * 0.1, 1e-6)
+        print(f"  Optimizer: AdamW (lr={lr})")
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=lr, weight_decay=config.weight_decay
+        )
+        return [optimizer]
+
     muon_params = []
     adamw_params = []
 
     for name, param in model.named_parameters():
-        if (param.ndim == 2 and 
-            'token_embedding' not in name and 
-            'norm' not in name and 
-            param.requires_grad):
+        if (
+            param.ndim == 2
+            and "token_embedding" not in name
+            and "norm" not in name
+            and param.requires_grad
+        ):
             muon_params.append(param)
         else:
-            adamw_params.append(param)
+            if param.requires_grad:
+                adamw_params.append(param)
 
     print(f"  Muon parameters: {sum(p.numel() for p in muon_params):,}")
     print(f"  AdamW parameters: {sum(p.numel() for p in adamw_params):,}")
 
     muon_optimizer = Muon(muon_params, lr=config.muon_lr, momentum=0.95)
-    adamw_optimizer = torch.optim.AdamW(adamw_params, lr=config.muon_lr*0.1, weight_decay=config.weight_decay)
+    secondary_lr = getattr(config, "learning_rate", None) or config.muon_lr * 0.1
+    adamw_optimizer = torch.optim.AdamW(
+        adamw_params, lr=secondary_lr, weight_decay=config.weight_decay
+    )
 
     return [muon_optimizer, adamw_optimizer]
 

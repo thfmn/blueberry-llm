@@ -12,3 +12,5 @@ pymdown-extensions
 typer
 rich
 wandb
+requests-oauthlib
+sqlalchemy[asyncio]>=2.0,<3.0

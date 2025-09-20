@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import time
 from dataclasses import asdict
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
 from llm import (
     MoEModelConfig,
     MoEMinimalLLM,
+    Muon,
     TextTokenDataset,
     load_and_cache_data,
     evaluate_model,
@@ -87,7 +88,7 @@ def run_single_experiment(
 
     # Minimal training loop: reuse evaluate_model and loss logic from llm.train_moe_model
     model.train()
-    optim = torch.optim.AdamW(model.parameters(), lr=config.muon_lr * 0.1)
+    optimizers = _build_optimizers(model, config)
     steps = 0
     tokens_per_step = config.batch_size * config.max_seq_len
     # Aux loss aggregation
@@ -109,10 +110,14 @@ def run_single_experiment(
             logits.view(-1, config.vocab_size), y.view(-1)
         )
         loss = ce + (aux_loss if aux_loss is not None else 0.0)
-        optim.zero_grad(set_to_none=True)
+        for optimizer in optimizers:
+            optimizer.zero_grad(set_to_none=True)
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-        optim.step()
+
+        for optimizer in optimizers:
+            optimizer.step()
         steps += 1
         if aux_loss is not None:
             aux_sum += float(aux_loss.detach().item())
@@ -176,3 +181,30 @@ def run_single_experiment(
                 summary_payload[f"final_{key}"] = final[key]
         log_hook("summary", summary_payload)
     return model, metrics
+def _build_optimizers(model: torch.nn.Module, config: MoEModelConfig) -> List[torch.optim.Optimizer]:
+    choice = getattr(config, "optimizer", "adamw").lower()
+    if choice not in {"adamw", "muon"}:
+        choice = "adamw"
+
+    if choice == "adamw":
+        lr = getattr(config, "learning_rate", None) or max(config.muon_lr * 0.1, 1e-6)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=config.weight_decay)
+        return [optimizer]
+
+    muon_params: List[torch.nn.Parameter] = []
+    adamw_params: List[torch.nn.Parameter] = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.ndim >= 2 and "norm" not in name:
+            muon_params.append(param)
+        else:
+            adamw_params.append(param)
+
+    if not muon_params:
+        muon_params = list(model.parameters())
+
+    muon_optimizer = Muon(muon_params, lr=config.muon_lr, momentum=0.95)
+    secondary_lr = getattr(config, "learning_rate", None) or config.muon_lr * 0.1
+    adamw_optimizer = torch.optim.AdamW(adamw_params, lr=secondary_lr, weight_decay=config.weight_decay)
+    return [muon_optimizer, adamw_optimizer]
